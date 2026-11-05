@@ -1,16 +1,27 @@
 -- =========================================================
---  MiniOS - serveur de comptes et de messagerie
+--  MiniOS - serveur de comptes et de messagerie (v0.4)
+--
 --  A lancer sur UN ordinateur avance avec un modem :
 --      minios_server
 --  (renomme-le "startup" pour qu'il demarre tout seul)
---  Les comptes sont ranges dans le fichier "accounts.db".
---  Attention : l'ordinateur doit rester dans un chunk charge,
---  sinon le serveur s'arrete.
+--
+--  Les comptes sont COMMUNS a tous les ordinateurs MiniOS du
+--  monde : ils sont ranges ici, dans "accounts.db".
+--  - au premier lancement, tu crees le compte administrateur
+--  - les administrateurs gerent ensuite les comptes depuis MiniOS
+--  - tout le monde peut creer un compte (non admin) depuis l'ecran
+--    de connexion de MiniOS
+--  - mot de passe admin perdu : minios_server admin
+--
+--  L'ordinateur doit rester dans un chunk charge, sinon le
+--  serveur s'arrete et plus personne ne peut se connecter.
 -- =========================================================
 
 local AUTH, CHAT = "minios_auth", "minios_chat"
 local HOSTNAME = "minios-server"
 local ACCOUNTS_FILE = "accounts.db"
+local MIN_PASSWORD = 4
+local args = { ... }
 
 -- ===== DEBUT CRYPTO (identique dans minios.lua et minios_server.lua) =====
 -- SHA-256 + HMAC-SHA-256 en Lua pur (via la bibliotheque bit32 de CC: Tweaked)
@@ -86,6 +97,15 @@ local function hmac(key, msg)
   return sha256(table.concat(opad) .. hexToBin(sha256(table.concat(ipad) .. msg)))
 end
 
+-- XOR de deux chaines hexadecimales de meme longueur (chiffrement a cle de session)
+local function xorHex(a, b)
+  local out = {}
+  for i = 1, #a do
+    out[i] = string.format("%x", bxor(tonumber(a:sub(i, i), 16), tonumber(b:sub(i, i), 16)))
+  end
+  return table.concat(out)
+end
+
 math.randomseed((os.epoch and os.epoch("utc") or os.clock() * 1000) % 2147483647 + os.getComputerID())
 
 local function randomHex(n)
@@ -94,6 +114,78 @@ local function randomHex(n)
   return table.concat(t)
 end
 -- ===== FIN CRYPTO =====
+
+-- ---------------------------------------------------------
+--  Comptes : accounts[nom en minuscules] = { name, salt, h, admin }
+-- ---------------------------------------------------------
+local accounts = {}
+
+local function loadAccounts()
+  if not fs.exists(ACCOUNTS_FILE) then return end
+  local f = fs.open(ACCOUNTS_FILE, "r")
+  local data = textutils.unserialize(f.readAll())
+  f.close()
+  if type(data) == "table" then accounts = data end
+end
+
+local function saveAccounts()
+  local f = fs.open(ACCOUNTS_FILE, "w")
+  f.write(textutils.serialize(accounts))
+  f.close()
+end
+
+local function validName(name)
+  return type(name) == "string" and #name >= 3 and #name <= 16 and name:match("^[%w_%-]+$") ~= nil
+end
+
+local function adminCount()
+  local n = 0
+  for _, a in pairs(accounts) do
+    if a.admin then n = n + 1 end
+  end
+  return n
+end
+
+-- ---------------------------------------------------------
+--  Creation / reinitialisation d'un administrateur (console)
+-- ---------------------------------------------------------
+local function promptAdmin()
+  while true do
+    print("Compte administrateur (3-16 car. : lettres, chiffres, _ -)")
+    write("Nom : ")
+    local name = read()
+    write("Mot de passe : ")
+    local pw = read("*")
+    write("Confirme : ")
+    local pw2 = read("*")
+    if not validName(name) then
+      print("Nom invalide.")
+    elseif #pw < MIN_PASSWORD then
+      print("Mot de passe trop court (min " .. MIN_PASSWORD .. ").")
+    elseif pw ~= pw2 then
+      print("Les mots de passe different.")
+    else
+      local existed = accounts[name:lower()] ~= nil
+      local salt = randomHex(16)
+      accounts[name:lower()] = { name = name, salt = salt, h = sha256(salt .. pw), admin = true }
+      saveAccounts()
+      print(existed and "Compte mis a jour (administrateur)." or "Compte administrateur cree.")
+      return
+    end
+  end
+end
+
+loadAccounts()
+
+if args[1] == "admin" then
+  promptAdmin()
+  return
+end
+
+if adminCount() == 0 then
+  print("Premiere installation : aucun administrateur.")
+  promptAdmin()
+end
 
 -- ---------------------------------------------------------
 --  Modem
@@ -115,25 +207,6 @@ end
 rednet.host(AUTH, HOSTNAME)
 
 -- ---------------------------------------------------------
---  Comptes : accounts[nom en minuscules] = { name, salt, h }
--- ---------------------------------------------------------
-local accounts = {}
-
-local function loadAccounts()
-  if not fs.exists(ACCOUNTS_FILE) then return end
-  local f = fs.open(ACCOUNTS_FILE, "r")
-  local data = textutils.unserialize(f.readAll())
-  f.close()
-  if type(data) == "table" then accounts = data end
-end
-
-local function saveAccounts()
-  local f = fs.open(ACCOUNTS_FILE, "w")
-  f.write(textutils.serialize(accounts))
-  f.close()
-end
-
--- ---------------------------------------------------------
 --  Etat : connexions en cours et sessions ouvertes
 --  sessions[id de l'ordinateur] = { user, sk (cle de session), c (compteur) }
 -- ---------------------------------------------------------
@@ -146,6 +219,13 @@ end
 local function reply(id, t) rednet.send(id, t, AUTH) end
 local function toChat(id, t) rednet.send(id, t, CHAT) end
 
+-- Reponse a une requete signee : renvoie le meme compteur pour que le
+-- client reconnaisse la reponse qui lui correspond.
+local function answer(id, m, t)
+  if type(m.c) == "number" then t.c = m.c end
+  reply(id, t)
+end
+
 local function broadcast(t)
   for id in pairs(sessions) do toChat(id, t) end
 end
@@ -153,6 +233,16 @@ end
 local function findSession(name)
   for id, s in pairs(sessions) do
     if s.user:lower() == name:lower() then return id, s end
+  end
+end
+
+-- Ferme les sessions d'un compte (suppression, mot de passe reinitialise)
+local function kickUser(key, exceptId)
+  for id, s in pairs(sessions) do
+    if s.user:lower() == key and id ~= exceptId then
+      toChat(id, { t = "kick" })
+      sessions[id] = nil
+    end
   end
 end
 
@@ -171,12 +261,38 @@ local function verified(id, m)
   return s
 end
 
+local function authed(id, m)
+  local s = verified(id, m)
+  if not s then
+    answer(id, m, { t = "err", x = "Session invalide, reconnecte-toi" })
+  end
+  return s
+end
+
+local function adminOnly(id, m)
+  local s = authed(id, m)
+  if not s then return nil end
+  local acc = accounts[s.user:lower()]
+  if not (acc and acc.admin) then
+    answer(id, m, { t = "err", x = "Reserve aux administrateurs" })
+    return nil
+  end
+  return s
+end
+
+-- Les empreintes de mot de passe envoyees apres la connexion sont
+-- chiffrees avec la cle de session (XOR) : elles ne circulent pas en clair.
+local function decryptHash(s, m, enc)
+  if type(enc) ~= "string" or #enc ~= 64 or not enc:match("^%x+$") then return nil end
+  return xorHex(enc, hmac(s.sk, "enc|" .. m.c))
+end
+
 -- ---------------------------------------------------------
---  Traitement des requetes
+--  Requetes non signees : creation de compte et connexion
 -- ---------------------------------------------------------
 local function onRegister(id, m)
   local user = m.u
-  if type(user) ~= "string" or #user < 3 or #user > 16 or not user:match("^[%w_%-]+$") then
+  if not validName(user) then
     return reply(id, { t = "err", x = "Nom invalide (3-16 car. : lettres, chiffres, _ -)" })
   end
   if type(m.salt) ~= "string" or not m.salt:match("^%x+$") or #m.salt > 64
@@ -186,7 +302,7 @@ local function onRegister(id, m)
   if accounts[user:lower()] then
     return reply(id, { t = "err", x = "Ce nom est deja pris" })
   end
-  accounts[user:lower()] = { name = user, salt = m.salt, h = m.h }
+  accounts[user:lower()] = { name = user, salt = m.salt, h = m.h, admin = false }
   saveAccounts()
   log("Nouveau compte : " .. user)
   reply(id, { t = "ok" })
@@ -205,10 +321,10 @@ end
 local function onLogin(id, m)
   local p = pending[id]
   pending[id] = nil
-  if not p or type(m.p) ~= "string" then
+  local acc = p and accounts[p.key]
+  if not acc or type(m.p) ~= "string" then
     return reply(id, { t = "err", x = "Identifiants incorrects" })
   end
-  local acc = accounts[p.key]
   local sk = hmac(acc.h, p.n)
   if hmac(sk, "login") ~= m.p then
     log("Echec de connexion : " .. acc.name)
@@ -216,21 +332,22 @@ local function onLogin(id, m)
   end
   sessions[id] = { user = acc.name, sk = sk, c = 0 }
   log(acc.name .. " connecte (ordinateur " .. id .. ")")
-  reply(id, { t = "ok", user = acc.name })
+  reply(id, { t = "ok", user = acc.name, admin = acc.admin == true })
   broadcast({ t = "sys", x = acc.name .. " s'est connecte" })
 end
 
+-- ---------------------------------------------------------
+--  Requetes signees
+-- ---------------------------------------------------------
 local function onMsg(id, m)
-  local s = verified(id, m)
-  if not s then
-    return reply(id, { t = "err", x = "Session invalide, reconnecte-toi" })
-  end
+  local s = authed(id, m)
+  if not s then return end
   local text = (m.x or ""):sub(1, 200)
-  if text == "" then return end
+  if text == "" then return answer(id, m, { t = "ok" }) end
   if m.to then
     local tid, ts = findSession(m.to)
     if not tid then
-      return reply(id, { t = "err", x = m.to .. " n'est pas connecte" })
+      return answer(id, m, { t = "err", x = m.to .. " n'est pas connecte" })
     end
     local pkt = { t = "chat", from = s.user, to = ts.user, x = text }
     toChat(tid, pkt)
@@ -238,21 +355,120 @@ local function onMsg(id, m)
   else
     broadcast({ t = "chat", from = s.user, x = text })
   end
+  answer(id, m, { t = "ok" })
 end
 
 local function onBye(id, m)
-  local s = verified(id, m)
+  local s = authed(id, m)
   if not s then return end
   sessions[id] = nil
   log(s.user .. " deconnecte")
+  answer(id, m, { t = "ok" })
   broadcast({ t = "sys", x = s.user .. " s'est deconnecte" })
 end
 
+-- Changer son propre mot de passe : x = "sel:empreinte chiffree"
+local function onPasswd(id, m)
+  local s = authed(id, m)
+  if not s then return end
+  local salt, enc = tostring(m.x):match("^(%x+):(%x+)$")
+  local h = salt and #salt <= 64 and decryptHash(s, m, enc)
+  if not h then return answer(id, m, { t = "err", x = "Requete invalide" }) end
+  local acc = accounts[s.user:lower()]
+  acc.salt, acc.h = salt, h
+  saveAccounts()
+  log("Mot de passe modifie : " .. acc.name)
+  answer(id, m, { t = "ok" })
+end
+
+local function onUsers(id, m)
+  if not adminOnly(id, m) then return end
+  local list = {}
+  for _, a in pairs(accounts) do
+    list[#list + 1] = { name = a.name, admin = a.admin == true }
+  end
+  table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+  answer(id, m, { t = "users", list = list })
+end
+
+-- Creer un compte (admin) : x = "nom:sel:empreinte chiffree:admin(0/1)"
+local function onAddUser(id, m)
+  local s = adminOnly(id, m)
+  if not s then return end
+  local name, salt, enc, flag = tostring(m.x):match("^([^:]*):(%x+):(%x+):([01])$")
+  local h = name and #salt <= 64 and decryptHash(s, m, enc)
+  if not validName(name) or not h then
+    return answer(id, m, { t = "err", x = "Requete invalide (nom : 3-16 car. : lettres, chiffres, _ -)" })
+  end
+  if accounts[name:lower()] then
+    return answer(id, m, { t = "err", x = "Ce nom est deja pris" })
+  end
+  accounts[name:lower()] = { name = name, salt = salt, h = h, admin = flag == "1" }
+  saveAccounts()
+  log(s.user .. " a cree le compte " .. name .. (flag == "1" and " (admin)" or ""))
+  answer(id, m, { t = "ok" })
+end
+
+local function onDelUser(id, m)
+  local s = adminOnly(id, m)
+  if not s then return end
+  local key = type(m.to) == "string" and m.to:lower() or ""
+  local target = accounts[key]
+  if not target then return answer(id, m, { t = "err", x = "Utilisateur inconnu" }) end
+  if key == s.user:lower() then
+    return answer(id, m, { t = "err", x = "Tu ne peux pas supprimer ton propre compte" })
+  end
+  if target.admin and adminCount() <= 1 then
+    return answer(id, m, { t = "err", x = "Impossible : dernier administrateur" })
+  end
+  accounts[key] = nil
+  saveAccounts()
+  kickUser(key)
+  log(s.user .. " a supprime le compte " .. target.name)
+  answer(id, m, { t = "ok" })
+end
+
+-- Changer le role : to = nom, x = "1" (admin) ou "0"
+local function onSetAdmin(id, m)
+  local s = adminOnly(id, m)
+  if not s then return end
+  local key = type(m.to) == "string" and m.to:lower() or ""
+  local target = accounts[key]
+  if not target then return answer(id, m, { t = "err", x = "Utilisateur inconnu" }) end
+  if m.x ~= "0" and m.x ~= "1" then return answer(id, m, { t = "err", x = "Requete invalide" }) end
+  if m.x == "0" and target.admin and adminCount() <= 1 then
+    return answer(id, m, { t = "err", x = "Impossible : dernier administrateur" })
+  end
+  target.admin = m.x == "1"
+  saveAccounts()
+  log(s.user .. " : " .. target.name .. (target.admin and " devient admin" or " n'est plus admin"))
+  answer(id, m, { t = "ok" })
+end
+
+-- Reinitialiser le mot de passe d'un autre compte : to = nom, x = "sel:empreinte chiffree"
+local function onResetPw(id, m)
+  local s = adminOnly(id, m)
+  if not s then return end
+  local key = type(m.to) == "string" and m.to:lower() or ""
+  local target = accounts[key]
+  if not target then return answer(id, m, { t = "err", x = "Utilisateur inconnu" }) end
+  local salt, enc = tostring(m.x):match("^(%x+):(%x+)$")
+  local h = salt and #salt <= 64 and decryptHash(s, m, enc)
+  if not h then return answer(id, m, { t = "err", x = "Requete invalide" }) end
+  target.salt, target.h = salt, h
+  saveAccounts()
+  kickUser(key, id)
+  log(s.user .. " a reinitialise le mot de passe de " .. target.name)
+  answer(id, m, { t = "ok" })
+end
+
 local handlers = {
-  reg = onRegister, hello = onHello, login = onLogin, msg = onMsg, bye = onBye,
+  reg = onRegister, hello = onHello, login = onLogin,
+  msg = onMsg, bye = onBye, passwd = onPasswd,
+  users = onUsers, adduser = onAddUser, deluser = onDelUser,
+  setadmin = onSetAdmin, resetpw = onResetPw,
 }
 
-loadAccounts()
 log("Serveur pret (nom '" .. HOSTNAME .. "', ordinateur " .. os.getComputerID() .. ")")
 
 while true do
