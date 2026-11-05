@@ -1,5 +1,6 @@
 -- =========================================================
---  MiniOS - serveur de comptes et de messagerie (v0.4)
+--  MiniOS - serveur de comptes et de messagerie
+-- @minios:server (ne pas supprimer : sert a verifier les mises a jour)
 --
 --  A lancer sur UN ordinateur avance avec un modem :
 --      minios_server
@@ -16,6 +17,11 @@
 --  L'ordinateur doit rester dans un chunk charge, sinon le
 --  serveur s'arrete et plus personne ne peut se connecter.
 -- =========================================================
+
+local VERSION = "0.5"
+local UPDATE_BASE = "https://raw.githubusercontent.com/MattheHunter/Lua/main/"
+local SERVER_FILE = "minios_server.lua"
+local SELF = (shell and shell.getRunningProgram and shell.getRunningProgram()) or "minios_server"
 
 local AUTH, CHAT = "minios_auth", "minios_chat"
 local HOSTNAME = "minios-server"
@@ -115,6 +121,73 @@ local function randomHex(n)
 end
 -- ===== FIN CRYPTO =====
 
+-- ===== DEBUT MISE A JOUR (identique dans minios.lua et minios_server.lua) =====
+local function parseVersion(v)
+  local t = {}
+  for n in tostring(v):gmatch("%d+") do t[#t + 1] = tonumber(n) end
+  return t
+end
+
+-- true si la version a est plus recente que la version b
+local function isNewer(a, b)
+  local x, y = parseVersion(a), parseVersion(b)
+  for i = 1, math.max(#x, #y) do
+    local p, q = x[i] or 0, y[i] or 0
+    if p ~= q then return p > q end
+  end
+  return false
+end
+
+-- Controle un fichier telecharge avant de l'installer : bonne marque
+-- (client ou serveur), numero de version, et il doit au moins compiler.
+local function inspectUpdate(body, kind)
+  if type(body) ~= "string" or #body < 2000 then
+    return nil, "Fichier recu invalide (trop court)"
+  end
+  if not body:find("-- @minios:" .. kind, 1, true) then
+    return nil, "Ce n'est pas le fichier " .. kind
+  end
+  local version = body:match('local VERSION = "([%d%.]+)"')
+  if not version then return nil, "Version introuvable dans le fichier recu" end
+  local fn, err = load(body, "=update", "t", {})
+  if not fn then return nil, "Fichier recu invalide : " .. tostring(err) end
+  return version
+end
+
+-- Ecrit un fichier en gardant l'ancienne version dans "<fichier>.bak",
+-- relit pour verifier, et restaure l'ancienne version en cas de probleme.
+local function writeFileSafe(path, body)
+  local bak = path .. ".bak"
+  if fs.exists(path) then
+    if fs.exists(bak) then fs.delete(bak) end
+    fs.copy(path, bak)
+  end
+  local f = fs.open(path, "w")
+  if not f then return false, "Ecriture impossible : " .. path end
+  f.write(body)
+  f.close()
+  local check = fs.open(path, "r")
+  local same = false
+  if check then
+    same = check.readAll() == body
+    check.close()
+  end
+  if not same then
+    if fs.exists(bak) then
+      fs.delete(path)
+      fs.copy(bak, path)
+    end
+    return false, "Verification de l'ecriture echouee (ancienne version restauree)"
+  end
+  return true
+end
+
+local function isStartup(path)
+  local name = fs.getName(path)
+  return name == "startup" or name == "startup.lua"
+end
+-- ===== FIN MISE A JOUR =====
+
 -- ---------------------------------------------------------
 --  Comptes : accounts[nom en minuscules] = { name, salt, h, admin }
 -- ---------------------------------------------------------
@@ -136,6 +209,26 @@ end
 
 local function validName(name)
   return type(name) == "string" and #name >= 3 and #name <= 16 and name:match("^[%w_%-]+$") ~= nil
+end
+
+-- Couleurs de nom dans la messagerie (noms des couleurs de CC)
+local CHAT_COLORS = { "white", "orange", "magenta", "lightBlue", "yellow", "lime",
+  "pink", "lightGray", "cyan", "green", "red" }
+
+local function validColor(name)
+  for _, c in ipairs(CHAT_COLORS) do
+    if c == name then return true end
+  end
+  return false
+end
+
+-- Couleur par defaut : fixe pour un nom donne, differente d'un nom a l'autre
+local function colorOf(acc)
+  if not acc then return "white" end
+  if validColor(acc.color) then return acc.color end
+  local n = 0
+  for i = 1, #acc.name do n = n + acc.name:byte(i) end
+  return CHAT_COLORS[n % #CHAT_COLORS + 1]
 end
 
 local function adminCount()
@@ -175,7 +268,42 @@ local function promptAdmin()
   end
 end
 
+-- Telecharge la derniere version du serveur sur GitHub et l'installe.
+-- Renvoie true + nouvelle version, ou false + message d'erreur.
+local function selfUpdate()
+  if not http then return false, "HTTP desactive sur ce serveur" end
+  local r, err = http.get(UPDATE_BASE .. SERVER_FILE .. "?t=" .. os.epoch("utc"))
+  if not r then return false, "Telechargement impossible : " .. tostring(err) end
+  local body = r.readAll()
+  r.close()
+  local version, e = inspectUpdate(body, "server")
+  if not version then return false, e end
+  if not isNewer(version, VERSION) then
+    return false, "Deja a jour (version " .. VERSION .. ")"
+  end
+  local ok, e2 = writeFileSafe(SELF, body)
+  if not ok then return false, e2 end
+  return true, version
+end
+
 loadAccounts()
+
+if args[1] == "update" then
+  local ok, res = selfUpdate()
+  if ok then
+    print("Mise a jour installee : version " .. res)
+    if isStartup(SELF) then
+      print("Redemarrage...")
+      sleep(1)
+      os.reboot()
+    else
+      print("Relance minios_server pour l'appliquer.")
+    end
+  else
+    print(res)
+  end
+  return
+end
 
 if args[1] == "admin" then
   promptAdmin()
@@ -332,7 +460,8 @@ local function onLogin(id, m)
   end
   sessions[id] = { user = acc.name, sk = sk, c = 0 }
   log(acc.name .. " connecte (ordinateur " .. id .. ")")
-  reply(id, { t = "ok", user = acc.name, admin = acc.admin == true })
+  reply(id, { t = "ok", user = acc.name, admin = acc.admin == true,
+              color = colorOf(acc), sv = VERSION })
   broadcast({ t = "sys", x = acc.name .. " s'est connecte" })
 end
 
@@ -349,11 +478,13 @@ local function onMsg(id, m)
     if not tid then
       return answer(id, m, { t = "err", x = m.to .. " n'est pas connecte" })
     end
-    local pkt = { t = "chat", from = s.user, to = ts.user, x = text }
+    local pkt = { t = "chat", from = s.user, to = ts.user,
+                  col = colorOf(accounts[s.user:lower()]),
+                  tcol = colorOf(accounts[ts.user:lower()]), x = text }
     toChat(tid, pkt)
     if tid ~= id then toChat(id, pkt) end
   else
-    broadcast({ t = "chat", from = s.user, x = text })
+    broadcast({ t = "chat", from = s.user, col = colorOf(accounts[s.user:lower()]), x = text })
   end
   answer(id, m, { t = "ok" })
 end
@@ -462,14 +593,42 @@ local function onResetPw(id, m)
   answer(id, m, { t = "ok" })
 end
 
+-- Choisir la couleur de son nom : x = nom de la couleur
+local function onSetColor(id, m)
+  local s = authed(id, m)
+  if not s then return end
+  if not validColor(m.x) then return answer(id, m, { t = "err", x = "Couleur inconnue" }) end
+  accounts[s.user:lower()].color = m.x
+  saveAccounts()
+  answer(id, m, { t = "ok" })
+end
+
+-- Mise a jour du serveur depuis GitHub (administrateurs)
+local function onUpdate(id, m)
+  if not adminOnly(id, m) then return end
+  local ok, res = selfUpdate()
+  if not ok then return answer(id, m, { t = "err", x = res }) end
+  local restart = isStartup(SELF)
+  log("Mise a jour installee : version " .. res)
+  answer(id, m, { t = "ok", x = res, restart = restart })
+  if restart then
+    broadcast({ t = "sys", x = "Le serveur redemarre (version " .. res .. ")" })
+    sleep(1)
+    os.reboot()
+  else
+    log("Relance minios_server pour appliquer la mise a jour.")
+  end
+end
+
 local handlers = {
   reg = onRegister, hello = onHello, login = onLogin,
   msg = onMsg, bye = onBye, passwd = onPasswd,
   users = onUsers, adduser = onAddUser, deluser = onDelUser,
   setadmin = onSetAdmin, resetpw = onResetPw,
+  setcolor = onSetColor, update = onUpdate,
 }
 
-log("Serveur pret (nom '" .. HOSTNAME .. "', ordinateur " .. os.getComputerID() .. ")")
+log("Serveur pret (version " .. VERSION .. ", ordinateur " .. os.getComputerID() .. ")")
 
 while true do
   local id, m = rednet.receive(AUTH)

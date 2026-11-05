@@ -1,5 +1,6 @@
 -- =========================================================
---  MiniOS 0.4 - un petit systeme a sessions pour CC: Tweaked
+--  MiniOS - un petit systeme a sessions pour CC: Tweaked
+-- @minios:client (ne pas supprimer : sert a verifier les mises a jour)
 --  (ordinateur avance, avec ecran couleur)
 --
 --  Usage : minios            (pour tester)
@@ -11,7 +12,9 @@
 --  - ecran de connexion avec creation de compte libre
 --  - dossier personnel et theme par utilisateur (propres a chaque
 --    ordinateur), verrouillage, verrouillage automatique
---  - messagerie : tes messages sont recus pendant toute la session
+--  - messagerie : messages recus pendant toute la session, couleur de
+--    nom au choix, messages publics et prives de couleurs differentes
+--  - mises a jour depuis GitHub (administrateurs) : appli "Mises a jour"
 --
 --  Ce n'est PAS une vraie securite : CC n'a pas de systeme de
 --  droits, et quelqu'un qui a acces aux fichiers d'un ordinateur
@@ -20,10 +23,17 @@
 --  affiche pas correctement avec de l'UTF-8).
 -- =========================================================
 
-local NAME, VERSION = "MiniOS", "0.4"
+local NAME = "MiniOS"
+local VERSION = "0.5"
+local UPDATE_BASE = "https://raw.githubusercontent.com/MattheHunter/Lua/main/"
+local CLIENT_FILE = "minios.lua"
+local SELF = (shell and shell.getRunningProgram and shell.getRunningProgram()) or "minios"
 local AUTH, CHAT = "minios_auth", "minios_chat"
 local SERVER_NAME = "minios-server"
 local HOME_ROOT = "/home"
+-- Couleurs de nom proposees dans la messagerie (noms des couleurs de CC)
+local CHAT_COLORS = { "white", "orange", "magenta", "lightBlue", "yellow", "lime",
+  "pink", "lightGray", "cyan", "green", "red" }
 local MIN_PASSWORD = 4
 local AUTOLOCK = 300  -- secondes d'inactivite avant verrouillage (0 = jamais)
 local KIOSK = true    -- true : Ctrl+T est ignore (on ne peut pas s'echapper
@@ -41,6 +51,8 @@ local defaultTheme = {
   accent = colors.orange, -- couleur d'accent
   text = colors.white,
   barText = colors.white,
+  chatPublic = colors.white,   -- texte des messages publics
+  chatPrivate = colors.pink,   -- texte des messages prives
 }
 local theme = {}
 local function resetTheme()
@@ -142,6 +154,73 @@ local function randomHex(n)
 end
 -- ===== FIN CRYPTO =====
 
+-- ===== DEBUT MISE A JOUR (identique dans minios.lua et minios_server.lua) =====
+local function parseVersion(v)
+  local t = {}
+  for n in tostring(v):gmatch("%d+") do t[#t + 1] = tonumber(n) end
+  return t
+end
+
+-- true si la version a est plus recente que la version b
+local function isNewer(a, b)
+  local x, y = parseVersion(a), parseVersion(b)
+  for i = 1, math.max(#x, #y) do
+    local p, q = x[i] or 0, y[i] or 0
+    if p ~= q then return p > q end
+  end
+  return false
+end
+
+-- Controle un fichier telecharge avant de l'installer : bonne marque
+-- (client ou serveur), numero de version, et il doit au moins compiler.
+local function inspectUpdate(body, kind)
+  if type(body) ~= "string" or #body < 2000 then
+    return nil, "Fichier recu invalide (trop court)"
+  end
+  if not body:find("-- @minios:" .. kind, 1, true) then
+    return nil, "Ce n'est pas le fichier " .. kind
+  end
+  local version = body:match('local VERSION = "([%d%.]+)"')
+  if not version then return nil, "Version introuvable dans le fichier recu" end
+  local fn, err = load(body, "=update", "t", {})
+  if not fn then return nil, "Fichier recu invalide : " .. tostring(err) end
+  return version
+end
+
+-- Ecrit un fichier en gardant l'ancienne version dans "<fichier>.bak",
+-- relit pour verifier, et restaure l'ancienne version en cas de probleme.
+local function writeFileSafe(path, body)
+  local bak = path .. ".bak"
+  if fs.exists(path) then
+    if fs.exists(bak) then fs.delete(bak) end
+    fs.copy(path, bak)
+  end
+  local f = fs.open(path, "w")
+  if not f then return false, "Ecriture impossible : " .. path end
+  f.write(body)
+  f.close()
+  local check = fs.open(path, "r")
+  local same = false
+  if check then
+    same = check.readAll() == body
+    check.close()
+  end
+  if not same then
+    if fs.exists(bak) then
+      fs.delete(path)
+      fs.copy(bak, path)
+    end
+    return false, "Verification de l'ecriture echouee (ancienne version restauree)"
+  end
+  return true
+end
+
+local function isStartup(path)
+  local name = fs.getName(path)
+  return name == "startup" or name == "startup.lua"
+end
+-- ===== FIN MISE A JOUR =====
+
 -- =========================================================
 --  Outils d'affichage et d'entree
 -- =========================================================
@@ -180,39 +259,45 @@ local session = nil
 local pendingAction = nil
 local kicked = false                     -- le serveur a ferme notre session
 local chatLog, unread, chatOpen = {}, 0, false
+local updateInfo, updateUrl = nil, nil   -- derniere version trouvee sur GitHub
+local onUpdateResponse                   -- definie plus loin (appli Mises a jour)
 
-local function addChatLine(text)
-  while #text > 0 do
-    chatLog[#chatLog + 1] = text:sub(1, w)
-    text = text:sub(w + 1)
-  end
+local function chatColor(name)
+  return type(name) == "string" and colors[name] or colors.white
+end
+
+local function addEntry(e)
+  chatLog[#chatLog + 1] = e
   while #chatLog > 200 do table.remove(chatLog, 1) end
+end
+
+-- Messages locaux de la messagerie : kind = "sys" ou "err"
+local function addChatLine(kind, text)
+  addEntry({ kind = kind, x = text })
 end
 
 -- Paquets envoyes par le serveur : messages, annonces, fermeture de session
 local function onChatPacket(b)
   if b.t == "chat" and type(b.from) == "string" and type(b.x) == "string" then
-    local line
+    local col = type(b.col) == "string" and b.col or nil
     if b.to then
-      if session and b.from == session.user then
-        line = "[MP a " .. tostring(b.to) .. "] " .. b.x
-      else
-        line = "[MP de " .. b.from .. "] " .. b.x
-      end
+      addEntry({ kind = "priv", from = b.from, to = tostring(b.to), col = col,
+                 tcol = type(b.tcol) == "string" and b.tcol or nil, x = b.x,
+                 mine = session ~= nil and b.from == session.user })
     else
-      line = b.from .. ": " .. b.x
+      addEntry({ kind = "pub", from = b.from, col = col, x = b.x })
     end
-    addChatLine(line)
     if not chatOpen then unread = unread + 1 end
   elseif b.t == "sys" and type(b.x) == "string" then
-    addChatLine("* " .. b.x)
+    addChatLine("sys", b.x)
   elseif b.t == "kick" then
     kicked = true
   end
 end
 
--- os.pullEvent qui ignore Ctrl+T en mode KIOSK et qui recoit les messages
--- du serveur ou que l'on soit dans MiniOS (la messagerie reste active)
+-- os.pullEvent qui ignore Ctrl+T en mode KIOSK et qui recoit, ou que l'on
+-- soit dans MiniOS : les messages du serveur et la reponse de la
+-- verification de mise a jour
 local function pullEvent(filter)
   while true do
     local ev, a, b, c, d = os.pullEventRaw(filter)
@@ -222,6 +307,9 @@ local function pullEvent(filter)
       if ev == "rednet_message" and session and a == session.serverId
         and c == CHAT and type(b) == "table" then
         onChatPacket(b)
+      elseif (ev == "http_success" or ev == "http_failure")
+        and updateUrl and a == updateUrl and onUpdateResponse then
+        onUpdateResponse(ev, b)
       end
       return ev, a, b, c, d
     end
@@ -328,7 +416,9 @@ local function login(serverId, user, pw)
   if not r2 then return nil, "Le serveur ne repond pas" end
   if r2.t ~= "ok" or type(r2.user) ~= "string" then return nil, r2.x or "Erreur" end
   return { user = r2.user, admin = r2.admin == true, serverId = serverId,
-           sk = sk, salt = r.salt, h = h, counter = 0 }
+           sk = sk, salt = r.salt, h = h, counter = 0,
+           color = type(r2.color) == "string" and r2.color or "white",
+           serverVersion = type(r2.sv) == "string" and r2.sv or "?" }
 end
 
 -- Requete signee avec la cle de session et numerotee (anti-rejeu).
@@ -341,7 +431,11 @@ local function call(kind, to, x, timeout)
   local sig = hmac(session.sk, table.concat({ c, kind, to or "", x or "" }, "|"))
   local r = request(session.serverId, { t = kind, c = c, to = to, x = x, s = sig }, timeout, c)
   if not r then return nil, "Le serveur ne repond pas" end
-  if r.t == "err" then return nil, r.x or "Erreur" end
+  if r.t == "err" then
+    -- le serveur ne nous connait plus (redemarrage...) : retour a la connexion
+    if r.x == "Session invalide, reconnecte-toi" then kicked = true end
+    return nil, r.x or "Erreur"
+  end
   return r
 end
 
@@ -453,6 +547,137 @@ end
 --  Applications : chaque appli est une fonction sans argument
 -- =========================================================
 
+-- ---------------------------------------------------------
+--  Mises a jour depuis GitHub (administrateurs)
+--  - verification automatique et discrete a la connexion (badge MAJ)
+--  - appli "Mises a jour" : verifier, mettre a jour cet ordinateur,
+--    mettre a jour le serveur
+-- ---------------------------------------------------------
+
+-- Telechargement HTTP qui laisse la messagerie fonctionner pendant l'attente
+local function httpGet(url, timeout)
+  if not http then return nil, "HTTP desactive (config de CC: Tweaked)" end
+  local ok, err = http.request(url)
+  if ok == false then return nil, "Requete refusee : " .. tostring(err) end
+  local deadline = os.startTimer(timeout or 20)
+  while true do
+    local ev, a, b = pullEvent()
+    if ev == "http_success" and a == url then
+      os.cancelTimer(deadline)
+      local body = b.readAll()
+      b.close()
+      return body
+    elseif ev == "http_failure" and a == url then
+      os.cancelTimer(deadline)
+      return nil, "Echec du telechargement : " .. tostring(b)
+    elseif ev == "timer" and a == deadline then
+      return nil, "Delai depasse"
+    end
+  end
+end
+
+-- Version plus recente que la notre ? (nil sinon). Seuls les admins la voient.
+local function updateAvailable()
+  if session and session.admin and updateInfo and isNewer(updateInfo.version, VERSION) then
+    return updateInfo.version
+  end
+  return nil
+end
+
+-- Verification asynchrone a la connexion d'un admin : ne bloque rien
+local function startUpdateCheck()
+  updateInfo, updateUrl = nil, nil
+  if not (http and session and session.admin) then return end
+  local url = UPDATE_BASE .. CLIENT_FILE .. "?t=" .. os.epoch("utc")
+  if http.request(url) ~= false then updateUrl = url end
+end
+
+onUpdateResponse = function(ev, handle)
+  updateUrl = nil
+  if ev ~= "http_success" or type(handle) ~= "table" then return end
+  local body = handle.readAll()
+  handle.close()
+  local version = inspectUpdate(body, "client")
+  if version then updateInfo = { version = version, body = body } end
+end
+
+-- Verification manuelle : telecharge et controle le fichier client
+local function fetchLatest()
+  local body, err = httpGet(UPDATE_BASE .. CLIENT_FILE .. "?t=" .. os.epoch("utc"))
+  if not body then return nil, err end
+  local version, e = inspectUpdate(body, "client")
+  if not version then return nil, e end
+  updateInfo = { version = version, body = body }
+  return updateInfo
+end
+
+local function updateApp()
+  local status = nil
+  while true do
+    clear(colors.black, colors.white)
+    bar(1, " Mises a jour", theme.barText, theme.bar)
+    local latest = updateInfo and updateInfo.version or "?"
+    writeAt(2, 3, "Cet ordinateur : " .. VERSION, colors.white, colors.black)
+    writeAt(2, 4, "Serveur         : " .. tostring(session.serverVersion), colors.white, colors.black)
+    writeAt(2, 5, "GitHub          : " .. latest, colors.white, colors.black)
+    if status then writeAt(2, 7, status, theme.accent, colors.black) end
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.setCursorPos(1, 9)
+    print("1) Verifier les mises a jour")
+    print("2) Mettre a jour cet ordinateur")
+    print("3) Mettre a jour le serveur")
+    print("Q) Retour")
+    print()
+    local choice = ask("> "):lower()
+
+    if choice == "q" then
+      return
+    elseif choice == "1" then
+      writeAt(2, 7, "Verification en cours...        ", theme.accent, colors.black)
+      local info, err = fetchLatest()
+      if not info then
+        status = err
+      elseif isNewer(info.version, VERSION) then
+        status = "Nouvelle version : " .. info.version
+      else
+        status = "Cet ordinateur est a jour."
+      end
+    elseif choice == "2" then
+      if not (updateInfo and isNewer(updateInfo.version, VERSION)) then
+        status = "Rien a installer (verifie d'abord)."
+      elseif ask("Installer la version " .. updateInfo.version .. " ? (o/n) : "):lower() == "o" then
+        local ok, err = writeFileSafe(SELF, updateInfo.body)
+        if not ok then
+          status = err
+        else
+          call("bye", nil, nil, 1)
+          if isStartup(SELF) then
+            notice("Version " .. updateInfo.version .. " installee.\nRedemarrage...")
+            os.reboot()
+          else
+            notice("Version " .. updateInfo.version .. " installee.\nRelance MiniOS avec : " .. fs.getName(SELF))
+            pendingAction = "exit"
+          end
+          return
+        end
+      end
+    elseif choice == "3" then
+      if ask("Mettre a jour le serveur ? (o/n) : "):lower() == "o" then
+        writeAt(2, 7, "Mise a jour du serveur...      ", theme.accent, colors.black)
+        local r, err = call("update", nil, nil, 30)
+        if not r then
+          status = err
+        elseif r.restart then
+          status = "Serveur mis a jour (" .. tostring(r.x) .. "), il redemarre."
+        else
+          status = "Serveur mis a jour (" .. tostring(r.x) .. "). Relance minios_server."
+        end
+      end
+    end
+  end
+end
+
 -- Terminal (administrateurs) : un shell classique, "exit" pour revenir
 local function terminalApp()
   clear(colors.black, colors.white)
@@ -543,8 +768,115 @@ end
 -- ---------------------------------------------------------
 --  Messagerie : les messages arrivent pendant toute la session
 --  (journal chatLog, compteur "Msg:n" sur le bureau) ; l'appli sert
---  a les lire et a en envoyer.
+--  a les lire, a en envoyer et a regler les couleurs.
+--    /msg nom texte  message prive
+--    /couleur        choisir les couleurs
+--    /quit           quitter l'appli
 -- ---------------------------------------------------------
+
+-- Une entree du journal -> liste de morceaux { texte, couleur }
+local function entrySegments(e)
+  local pub, priv = theme.chatPublic, theme.chatPrivate
+  if e.kind == "pub" then
+    return { { e.from, chatColor(e.col) }, { ": " .. e.x, pub } }
+  elseif e.kind == "priv" then
+    if e.mine then
+      return { { "[MP a ", priv }, { e.to, chatColor(e.tcol) }, { "] " .. e.x, priv } }
+    end
+    return { { "[MP de ", priv }, { e.from, chatColor(e.col) }, { "] " .. e.x, priv } }
+  elseif e.kind == "err" then
+    return { { "! " .. e.x, colors.red } }
+  end
+  return { { "* " .. e.x, colors.lightGray } }
+end
+
+-- Decoupe des morceaux colores en lignes de largeur width
+local function wrapSegments(segs, width)
+  local lines, cur, len = {}, {}, 0
+  for _, seg in ipairs(segs) do
+    local text, color = seg[1], seg[2]
+    while #text > 0 do
+      local piece = text:sub(1, width - len)
+      cur[#cur + 1] = { piece, color }
+      len = len + #piece
+      text = text:sub(#piece + 1)
+      if len >= width then
+        lines[#lines + 1] = cur
+        cur, len = {}, 0
+      end
+    end
+  end
+  if #cur > 0 or #lines == 0 then lines[#lines + 1] = cur end
+  return lines
+end
+
+local function indexOfName(name)
+  for i, n in ipairs(CHAT_COLORS) do
+    if n == name then return i end
+  end
+  return 1
+end
+
+local function indexOfValue(value)
+  for i, n in ipairs(CHAT_COLORS) do
+    if colors[n] == value then return i end
+  end
+  return 1
+end
+
+-- Reglages de la messagerie : couleur de mon nom (vue par tous, memorisee
+-- sur le serveur) et couleurs des messages publics / prives (pour moi)
+local function chatSettings()
+  local nameIdx = indexOfName(session.color)
+  local pubIdx = indexOfValue(theme.chatPublic)
+  local privIdx = indexOfValue(theme.chatPrivate)
+  local oldName = session.color
+  local sel = 1
+  local indexes = { nameIdx, pubIdx, privIdx }
+  local labels = { "Couleur de mon nom", "Messages publics", "Messages prives" }
+
+  while true do
+    clear(colors.black, colors.white)
+    bar(1, " Messagerie - couleurs", theme.barText, theme.bar)
+    for i = 1, 3 do
+      local y = 2 + (i - 1) * 3
+      local cname = CHAT_COLORS[indexes[i]]
+      writeAt(2, y, (i == sel and "> " or "  ") .. labels[i], colors.white, colors.black)
+      writeAt(5, y + 1, "< " .. cname .. " >", colors[cname], colors.black)
+    end
+    local nameCol = colors[CHAT_COLORS[indexes[1]]]
+    local pubCol = colors[CHAT_COLORS[indexes[2]]]
+    local privCol = colors[CHAT_COLORS[indexes[3]]]
+    writeAt(2, 12, "Apercu :", colors.lightGray, colors.black)
+    writeAt(2, 13, session.user, nameCol, colors.black)
+    writeAt(2 + #session.user, 13, ": Bonjour a tous", pubCol, colors.black)
+    writeAt(2, 14, "[MP de ", privCol, colors.black)
+    writeAt(9, 14, session.user, nameCol, colors.black)
+    writeAt(9 + #session.user, 14, "] Salut !", privCol, colors.black)
+    bar(h, " Fleches:changer  Entree:valider", theme.barText, theme.bar)
+
+    local _, key = pullEvent("key")
+    if key == keys.up and sel > 1 then
+      sel = sel - 1
+    elseif key == keys.down and sel < 3 then
+      sel = sel + 1
+    elseif key == keys.left then
+      indexes[sel] = (indexes[sel] - 2) % #CHAT_COLORS + 1
+    elseif key == keys.right then
+      indexes[sel] = indexes[sel] % #CHAT_COLORS + 1
+    elseif key == keys.enter or key == keys.q then
+      theme.chatPublic = colors[CHAT_COLORS[indexes[2]]]
+      theme.chatPrivate = colors[CHAT_COLORS[indexes[3]]]
+      saveSettings()
+      local newName = CHAT_COLORS[indexes[1]]
+      if newName ~= oldName then
+        local r, err = call("setcolor", nil, newName)
+        if r then session.color = newName else addChatLine("err", tostring(err)) end
+      end
+      return
+    end
+  end
+end
 
 local function chatApp()
   local input = ""
@@ -553,23 +885,37 @@ local function chatApp()
     clear(colors.black, colors.white)
     bar(1, " Chat - " .. session.user .. "  (ID " .. os.getComputerID() .. ")", theme.barText, theme.bar)
     local rows = h - 2
-    local first = math.max(1, #chatLog - rows + 1)
-    for i = first, #chatLog do
-      writeAt(1, 2 + i - first, chatLog[i], colors.white, colors.black)
+    local visual = {}
+    for i = #chatLog, 1, -1 do
+      local lines = wrapSegments(entrySegments(chatLog[i]), w)
+      for j = #lines, 1, -1 do table.insert(visual, 1, lines[j]) end
+      if #visual >= rows then break end
+    end
+    local first = math.max(1, #visual - rows + 1)
+    for i = first, #visual do
+      local x = 1
+      for _, seg in ipairs(visual[i]) do
+        writeAt(x, 2 + i - first, seg[1], seg[2], colors.black)
+        x = x + #seg[1]
+      end
     end
     writeAt(1, h, "> " .. input:sub(-(w - 3)) .. "_", theme.accent, colors.black)
   end
 
   local function sendMsg(to, text)
     local r, err = call("msg", to, text)
-    if not r then addChatLine("! " .. tostring(err)) end
+    if not r then addChatLine("err", tostring(err)) end
   end
 
   local function run()
-    if #chatLog == 0 then addChatLine("/w nom message = prive, /quit = sortir") end
+    if not session.chatHelp then   -- une fois par session
+      session.chatHelp = true
+      addChatLine("sys", "/msg nom texte = prive, /couleur, /quit")
+    end
     while true do
       draw()
       local ev, a = pullEvent()
+      if kicked then return end
       if ev == "char" then
         input = input .. a
       elseif ev == "key" then
@@ -578,11 +924,16 @@ local function chatApp()
         elseif a == keys.enter then
           local text = input
           input = ""
-          if text == "/quit" then
+          local cmd = text:match("^/(%S+)")
+          if cmd == "quit" then
             return
-          elseif text:sub(1, 3) == "/w " then
-            local to, msg = text:match("^/w%s+(%S+)%s+(.+)$")
-            if to then sendMsg(to, msg) else addChatLine("Usage : /w nom message") end
+          elseif cmd == "couleur" then
+            chatSettings()
+          elseif cmd == "msg" then
+            local to, msg = text:match("^/msg%s+(%S+)%s+(.+)$")
+            if to then sendMsg(to, msg) else addChatLine("err", "Usage : /msg nom message") end
+          elseif cmd then
+            addChatLine("err", "Commande inconnue (/msg, /couleur, /quit)")
           elseif text ~= "" then
             sendMsg(nil, text)
           end
@@ -824,6 +1175,7 @@ local apps = {
   { name = "Messagerie", run = chatApp },
   { name = "Reglages",   run = settingsApp },
   { name = "Comptes",    run = accountsApp },
+  { name = "Mises a jour", run = updateApp, admin = true },
   { name = "Session",    run = sessionApp },
 }
 
@@ -889,30 +1241,39 @@ local function drawClock()
   writeAt(w - #t + 1, 1, t, theme.barText, theme.bar)
 end
 
--- Dessine le bureau, renvoie le nombre de messages non lus affiche
+-- Etat des badges du bureau (pour savoir quand redessiner)
+local function stateKey()
+  return tostring(unread) .. "|" .. tostring(updateAvailable())
+end
+
+-- Dessine le bureau, renvoie l'etat des badges affiches
 local function drawDesktop()
   clear(theme.bg, theme.text)
   bar(1, " " .. NAME .. "  " .. session.user .. (session.admin and " [admin]" or ""),
     theme.barText, theme.bar)
   drawClock()
-  if unread > 0 then
-    local m = " Msg:" .. unread .. " "
-    writeAt(w - 7 - #m + 1, 1, m, colors.black, theme.accent)
+  local right = w - 7
+  local function badge(text, fg, bg)
+    right = right - #text
+    writeAt(right + 1, 1, text, fg, bg)
   end
+  if unread > 0 then badge(" Msg:" .. unread .. " ", colors.black, theme.accent) end
+  local update = updateAvailable()
+  if update then badge(" MAJ " .. update .. " ", colors.black, colors.lime) end
   for i, app in ipairs(menu) do
     local y = appRow(i)
     writeAt(3, y, "[" .. i .. "]", theme.accent, theme.bg)
     writeAt(7, y, app.name, theme.text, theme.bg)
   end
   bar(h, " Clic ou touche 1-" .. #menu, theme.barText, theme.bar)
-  return unread
+  return stateKey()
 end
 
 -- Renvoie "logout" ou "exit"
 local function desktop()
   local lastActivity = os.clock()
   while true do
-    local shownUnread = drawDesktop()
+    local shownState = drawDesktop()
     local timer = os.startTimer(1)
     local redraw = false
     while not redraw do
@@ -934,8 +1295,8 @@ local function desktop()
         lastActivity = os.clock()
         i = tonumber(a)
         if i and not menu[i] then i = nil end
-      elseif ev == "rednet_message" then
-        if unread ~= shownUnread then redraw = true end
+      elseif ev == "rednet_message" or ev == "http_success" or ev == "http_failure" then
+        if stateKey() ~= shownState then redraw = true end
       elseif ev == "term_resize" then
         w, h = term.getSize()
         redraw = true
@@ -966,7 +1327,9 @@ local function sessionLoop()
     kicked, unread, chatLog = false, 0, {}
     loadSettings()
     buildMenu()
+    startUpdateCheck()
     local action = desktop()
+    updateUrl = nil
     local wasKicked = kicked
     if not wasKicked then call("bye", nil, nil, 1) end
     session = nil   -- la cle de session disparait ici
